@@ -1,0 +1,81 @@
+authentication:
+  enabled: true
+  mutual:
+    spire:
+      install:
+        enabled: true
+bgpControlPlane:
+  enabled: true
+  secretsNamespace:
+    name: kube-system
+bpf:
+  masquerade: true
+dashboards:
+  enabled: true
+debug:
+  enabled: true
+  verbose: datapath flow kvstore envoy
+egressGateway:
+  enabled: true
+enableIPv4Masquerade: true
+enableIPv6Masquerade: true
+envoy:
+  connectTimeoutSeconds: 5
+  enabled: true
+  rollOutPods: true
+  securityContext:
+    capabilities:
+      envoy:
+      - NET_BIND_SERVICE
+      - CAP_NET_ADMIN
+      - CAP_BPF
+      - NET_ADMIN
+      - SYS_ADMIN
+      - SYS_RESOURCE
+      keepCapNetBindService: true
+externalIPs:
+  enabled: true
+gatewayAPI:
+  enableAlpn: true
+  enableAppProtocol: true
+  enabled: true
+  secretsNamespace:
+    name: cilium-secrets
+gatewayClass:
+  create: true
+hubble:
+  enabled: true
+  metrics:
+    dashboards:
+      enabled: true
+    enableOpenMetrics: true
+    enabled:
+    - dns
+    - drop
+    - tcp
+    - flow
+    - port-distribution
+    - icmp
+    - httpV2:exemplars=true;labelsContext=source_ip,source_namespace,source_workload,destination_namespace,destination_workload,traffic_direction
+  peerService:
+    clusterDomain: cluster.local
+    rollOutPods: true
+  relay:
+    enabled: true
+    rollOutPods: true
+  ui:
+    enabled: true
+    replicas: 1
+    rollOutPods: true
+kubeProxyReplacement: true
+l7Proxy: true
+loadBalancer:
+  l7:
+    backend: envoy
+nodePort:
+  enableHealthCheck: true
+  enabled: true
+policyAuditMode: false
+socketLB:
+  enabled: true
+  hostNamespaceOnly: true

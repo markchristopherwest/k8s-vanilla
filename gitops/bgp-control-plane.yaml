@@ -1,0 +1,76 @@
+---
+apiVersion: cilium.io/v2
+kind: CiliumBGPClusterConfig
+metadata:
+  name: cilium-bgp
+spec:
+  nodeSelector:
+    matchLabels:
+      bgp: "65020"
+  bgpInstances:
+    - name: "65020"
+      localASN: 65020
+      peers:
+      - name: "udm-pro-65000"
+        peerASN: 65000
+        autoDiscovery:
+          mode: "DefaultGateway"
+          defaultGateway:
+            addressFamily: ipv4  # Can be "ipv4" or "ipv6"
+        peerConfigRef:
+          name: "cilium-peer"
+---
+apiVersion: cilium.io/v2
+kind: CiliumBGPPeerConfig
+metadata:
+  name: cilium-peer
+spec:
+  gracefulRestart:
+    enabled: true
+    restartTimeSeconds: 15
+  families:
+    - afi: ipv4
+      safi: unicast
+      advertisements:
+        matchLabels:
+          advertise: "bgp"
+---
+apiVersion: cilium.io/v2
+kind: CiliumBGPAdvertisement
+metadata:
+  name: bgp-advertisements
+  labels:
+    advertise: bgp
+spec:
+  advertisements:
+    - advertisementType: "Service"
+      service:
+        addresses:
+          - LoadBalancerIP
+      selector:
+        matchExpressions:
+          - {key: gateway.networking.k8s.io/gateway-name, operator: In, values: ['my-gateway', 'tls-gateway']}
+---
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: dev-gw-lb-ip-pool
+spec:
+  blocks:
+    - start: "192.168.254.10"
+      stop: "192.168.254.19"
+  serviceSelector:
+    matchExpressions:
+      - {key: gateway.networking.k8s.io/gateway-name, operator: In, values: ['my-gateway', 'tls-gateway']}
+---
+apiVersion: cilium.io/v2
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: dev-np-lb-ip-pool
+spec:
+  blocks:
+    - start: "192.168.254.20"
+      stop: "192.168.254.29"
+  serviceSelector:
+    matchExpressions:
+      - {key: ingresses.networking.k8s.io/ingress-name, operator: In, values: ['my-ingress']}

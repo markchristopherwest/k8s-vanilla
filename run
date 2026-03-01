@@ -1,0 +1,1017 @@
+#!/usr/bin/env bash
+# =============================================================================
+# k8s-vanilla bootstrap script
+# =============================================================================
+set -eEo pipefail -o functrace
+shopt -s inherit_errexit
+
+# -----------------------------------------------------------------------------
+# Constants & globals
+# -----------------------------------------------------------------------------
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+RANDOMNESS=$(openssl rand -hex 3)
+readonly SCRIPT_DIR RANDOMNESS
+
+readonly GREEN='\033[0;32m'
+readonly BLUE='\033[0;94m'
+readonly LIGHT_BLUE='\033[0;34m'
+readonly YELLOW='\033[0;33m'
+readonly RED='\033[0;31m'
+readonly NC='\033[0m'
+
+# Kubernetes / CRI-O versions (single source of truth)
+readonly K8S_VERSION_SHORT="v1.35"
+readonly K8S_VERSION_LONG="1.35.0"
+readonly K8S_DEB_VERSION="${K8S_VERSION_LONG}-1.1"
+readonly CRIO_VERSION_SHORT="v1.35"
+readonly GATEWAY_API_VERSION="v1.2.0"
+readonly CILIUM_VERSION="1.18.6"
+
+# -----------------------------------------------------------------------------
+# Logging helpers
+# -----------------------------------------------------------------------------
+logFail()    { printf "${RED}✖ %s${NC}\n"         "$1" >&2; }
+logStep()    { printf "${BLUE}⚙  %s${NC}\n"       "$1" >&2; }
+logSubstep() { printf "\t${LIGHT_BLUE}- %s${NC}\n" "$1" >&2; }
+logSuccess() { printf "${GREEN}✔ %s${NC}\n"        "$1" >&2; }
+logWarn()    { printf "${YELLOW}⚠  %s${NC}\n"     "$1" >&2; }
+
+# -----------------------------------------------------------------------------
+# Error handling
+# -----------------------------------------------------------------------------
+failure() {
+  local lineno=$1 command="$2"
+  logFail "Error near line ${lineno}: '${command}' failed."
+}
+trap 'failure "${LINENO}" "${BASH_COMMAND}"' ERR
+
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+commandExists() { command -v "$1" &>/dev/null; }
+
+# Resolve the best HTTP download command and store it in URLGET_CMD
+URLGET_CMD=""
+getUrlCmd() {
+  if commandExists curl; then
+    URLGET_CMD="curl -fsSL"
+    [[ -n "${PROXY_ADDRESS:-}" ]] && URLGET_CMD+=" -x ${PROXY_ADDRESS}"
+  elif commandExists wget; then
+    URLGET_CMD="wget -qO-"
+  else
+    logFail "Neither curl nor wget found. Please install one."
+    exit 1
+  fi
+}
+
+# Interactive prompt helpers
+prompt() {
+  set +e; read -r PROMPT_RESULT </dev/tty; set -e
+}
+
+promptTimeout() {
+  set +e
+  local timeout_flag="${1:-}"
+  if [[ -z "${FAST_TIMEOUTS:-}" && -n "$timeout_flag" ]]; then
+    read -r -t "${timeout_flag#-t}" PROMPT_RESULT </dev/tty
+  else
+    read -r PROMPT_RESULT </dev/tty
+  fi
+  set -e
+}
+
+confirmY() {
+  printf "(Y/n) "
+  promptTimeout "$@"
+  [[ "${PROMPT_RESULT:-}" != "n" && "${PROMPT_RESULT:-}" != "N" ]]
+}
+
+# Prompt for a variable only if it is unset/empty
+promptIfUnset() {
+  local var_name="$1" prompt_msg="$2"
+  if [[ -z "${!var_name:-}" ]]; then
+    printf "%s\n" "$prompt_msg"
+    while true; do
+      printf "%s: " "$var_name"
+      prompt
+      if [[ -n "${PROMPT_RESULT:-}" ]]; then
+        printf -v "$var_name" '%s' "$PROMPT_RESULT"
+        return
+      fi
+    done
+  else
+    logSuccess "${var_name} is already set."
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# GitHub credential helpers (consolidated – no duplication)
+# -----------------------------------------------------------------------------
+GITHUB_ORG=""
+GITHUB_TOKEN=""
+GITHUB_USER=""
+GITHUB_REPO=""
+
+promptForGithubOrg()   { promptIfUnset GITHUB_ORG   "Enter your GitHub Org (from github.com/orgs):"; }
+promptForGithubToken() { promptIfUnset GITHUB_TOKEN  "Enter your GitHub PAT token:"; }
+promptForGithubUser()  { promptIfUnset GITHUB_USER   "Enter your GitHub username:"; }
+promptForGithubRepo()  { promptIfUnset GITHUB_REPO   "Enter your GitHub repository name:"; }
+
+# -----------------------------------------------------------------------------
+# Node preflight
+# -----------------------------------------------------------------------------
+general_preflight() {
+  logStep "[$RANDOMNESS] Preflight on $(hostname) (role: ${k8s_role:-unknown})"
+
+  sudo apt-get install -y apt-transport-https ca-certificates curl git gpg iptables conntrack
+
+  logSubstep "Loading br_netfilter kernel module"
+  echo br_netfilter | sudo tee /etc/modules-load.d/br_netfilter.conf >/dev/null
+  sudo systemctl restart systemd-modules-load.service
+
+  logSubstep "Enabling bridge netfilter for IPv4 & IPv6"
+  echo 1 | sudo tee /proc/sys/net/bridge/bridge-nf-call-iptables  >/dev/null
+  echo 1 | sudo tee /proc/sys/net/bridge/bridge-nf-call-ip6tables >/dev/null
+  sudo sysctl -p
+
+  logSubstep "Flushing iptables"
+  sudo iptables -F
+  sudo iptables -t nat    -F
+  sudo iptables -t mangle -F
+  sudo iptables -X
+
+  logSubstep "Disabling swap"
+  sudo swapoff -a
+  # Persist swap-off across reboots
+  sudo sed -i '/\bswap\b/d' /etc/fstab
+
+  THIS_HOSTNAME=$(hostname -f)
+
+  logSubstep "Appending cgroup options to kernel cmdline (Raspberry Pi)"
+  local cmdline="/boot/firmware/cmdline.txt"
+  if [[ -f "$cmdline" ]]; then
+    if ! grep -q "cgroup_enable=memory" "$cmdline"; then
+      sudo bash -c "sed -i 's/$/ cgroup_enable=memory cgroup_memory=1 cgroup_enable=cpuset/' $cmdline"
+    fi
+    sudo cat "$cmdline"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Raspberry Pi specific setup
+# -----------------------------------------------------------------------------
+got_pi() {
+  logStep "[$RANDOMNESS] Raspberry Pi setup"
+  sudo apt-get update
+  sudo apt-get upgrade -y
+
+  logSubstep "Creating k8s-admin user"
+  if ! id k8s-admin &>/dev/null; then
+    sudo adduser k8s-admin --quiet --disabled-password --gecos ""
+  fi
+  sudo usermod k8s-admin -aG pi,adm,dialout,cdrom,sudo,audio,video,plugdev,games,users,input,netdev,spi,i2c,gpio
+  getent group sudo
+
+  logSubstep "Removing dphys-swapfile"
+  sudo apt-get install -y dphys-swapfile
+  sudo dphys-swapfile swapoff
+  sudo dphys-swapfile uninstall
+  sudo systemctl disable dphys-swapfile
+}
+
+# -----------------------------------------------------------------------------
+# Container runtime installs
+# -----------------------------------------------------------------------------
+install_containerd() {
+  logStep "[$RANDOMNESS] Installing containerd"
+  sudo mkdir -p /etc/containerd
+  sudo apt-get install -y containerd
+  containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+  # Enable SystemdCgroup
+  sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  sudo systemctl enable --now containerd
+}
+
+install_crio() {
+  logStep "[$RANDOMNESS] Installing CRI-O ${CRIO_VERSION_SHORT}"
+
+  # Add CRI-O repo
+  curl -fsSL "https://pkgs.k8s.io/addons:/cri-o:/prerelease:/main/deb/Release.key" \
+    | sudo gpg --dearmor --yes -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] \
+https://pkgs.k8s.io/addons:/cri-o:/prerelease:/main/deb/ /" \
+    | sudo tee /etc/apt/sources.list.d/cri-o.list >/dev/null
+
+  # Add Kubernetes repo
+  curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_VERSION_SHORT}/deb/Release.key" \
+    | sudo gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
+https://pkgs.k8s.io/core:/stable:/${K8S_VERSION_SHORT}/deb/ /" \
+    | sudo tee /etc/apt/sources.list.d/kubernetes.list >/dev/null
+
+  sudo apt-get update
+
+  logSubstep "Installing kubeadm / kubelet / kubectl ${K8S_DEB_VERSION}"
+  sudo apt-mark unhold kubeadm kubectl kubelet 2>/dev/null || true
+  sudo apt-get install -y \
+    "kubeadm=${K8S_DEB_VERSION}" \
+    "kubelet=${K8S_DEB_VERSION}" \
+    "kubectl=${K8S_DEB_VERSION}"
+  sudo apt-mark hold kubeadm kubelet kubectl
+
+  logSubstep "Configuring kernel modules"
+  sudo modprobe overlay
+  sudo modprobe br_netfilter
+  # Persist across reboots
+  printf "overlay\nbr_netfilter\n" | sudo tee /etc/modules-load.d/k8s.conf >/dev/null
+
+  logSubstep "Writing sysctl settings"
+  sudo tee /etc/sysctl.d/99-kubernetes-cri.conf >/dev/null <<'EOF'
+net.bridge.bridge-nf-call-iptables  = 1
+net.ipv4.ip_forward                 = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+EOF
+  sudo sysctl --system
+
+  logSubstep "Installing & enabling CRI-O"
+  sudo apt-get install -y cri-o
+  sudo apt-mark hold cri-o
+  sudo systemctl enable --now crio
+
+  logSuccess "CRI-O installation complete."
+}
+
+# -----------------------------------------------------------------------------
+# Helm & CNI
+# -----------------------------------------------------------------------------
+install_helm() {
+  logStep "[$RANDOMNESS] Installing Helm"
+  if commandExists helm; then
+    logSubstep "Helm already installed: $(helm version --short)"
+    return
+  fi
+  local get_helm
+  get_helm=$(mktemp)
+  curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 -o "$get_helm"
+  chmod 700 "$get_helm"
+  "$get_helm"
+  rm -f "$get_helm"
+
+  logSubstep "Adding Cilium Helm repo"
+  helm repo add cilium https://helm.cilium.io/
+  helm repo update
+
+  logSubstep "Installing Cilium via Helm"
+  helm install cilium cilium/cilium \
+    --namespace kube-system \
+    --version "${CILIUM_VERSION}" \
+    --values ./helm/values-cilium.yaml \
+    --wait
+}
+
+# -----------------------------------------------------------------------------
+# Bootstrap (full node setup)
+# -----------------------------------------------------------------------------
+bootstrap() {
+  logStep "[$RANDOMNESS] Bootstrap starting"
+  general_preflight
+
+  if uname -r | grep -qi "raspi\|rpi\|raspberrypi"; then
+    logSubstep "Raspberry Pi detected"
+    got_pi
+  else
+    logSubstep "Non-Raspberry Pi system"
+  fi
+
+  install_crio
+
+  logStep "[$RANDOMNESS] Resolving network addresses"
+  IP_INSIDE=$(ip -o route get to 192.168.8.1 | sed -n 's/.*src \([0-9.]\+\).*/\1/p')
+  IP_OUTSIDE=$(ip -o route get to 8.8.8.8    | sed -n 's/.*src \([0-9.]\+\).*/\1/p')
+  logSubstep "Inside IP:  ${IP_INSIDE}"
+  logSubstep "Outside IP: ${IP_OUTSIDE}"
+
+  local address_api="https://${IP_INSIDE}:6443"
+  logStep "[$RANDOMNESS] API server address: ${address_api}"
+
+  sudo mkdir -p /etc/kubernetes/kubeadm/
+
+  # Determine public IP once
+  local PUBLIC_IP
+  PUBLIC_IP=$(curl -fsSL https://ifconfig.me)
+
+  local node_name
+  node_name=$(hostname)
+
+  if [[ "$node_name" == "k8s-0" ]]; then
+    # ---- Control-plane init ----
+    logStep "[$RANDOMNESS] Initialising control-plane on ${node_name}"
+
+    sudo apt-get install -y \
+      "kubelet=${K8S_DEB_VERSION}" \
+      "kubeadm=${K8S_DEB_VERSION}" \
+      "kubectl=${K8S_DEB_VERSION}"
+    sudo apt-mark hold kubelet kubeadm kubectl
+
+    cat > kubeadm-conf.yaml <<EOF
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: ${PUBLIC_IP}
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///var/run/crio/crio.sock
+  imagePullPolicy: IfNotPresent
+  imagePullSerial: true
+  name: ${node_name}
+timeouts:
+  controlPlaneComponentHealthCheck: 4m0s
+  discovery: 5m0s
+  etcdAPICall: 2m0s
+  kubeletHealthCheck: 4m0s
+  kubernetesAPICall: 1m0s
+  tlsBootstrap: 5m0s
+  upgradeManifests: 5m0s
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+controlPlaneEndpoint: "k8s-0:6443"
+certificatesDir: /etc/kubernetes/pki
+encryptionAlgorithm: RSA-4096
+apiServer:
+  certSANs:
+    - "${PUBLIC_IP}"
+    - "k8s.pki.llc"
+    - "192.168.8.10"
+    - "192.168.8.11"
+    - "192.168.8.12"
+    - "192.168.8.13"
+    - "192.168.8.14"
+    - "192.168.8.15"
+    - "192.168.8.16"
+    - "192.168.8.17"
+    - "192.168.8.18"
+    - "192.168.8.19"
+    - "k8s-0"
+    - "k8s-1"
+    - "k8s-2"
+    - "k8s-3"
+    - "k8s-4"
+    - "k8s-5"
+    - "k8s-6"
+    - "k8s-7"
+    - "k8s-8"
+    - "k8s-9"
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+    peerCertSANs:
+      - "192.168.8.10"
+      - "192.168.8.11"
+      - "192.168.8.12"
+      - "192.168.8.13"
+      - "192.168.8.14"
+      - "k8s-0"
+      - "k8s-1"
+      - "k8s-2"
+      - "k8s-3"
+      - "k8s-4"
+    serverCertSANs:
+      - "192.168.8.10"
+      - "192.168.8.11"
+      - "192.168.8.12"
+      - "k8s-0"
+      - "k8s-1"
+      - "k8s-2"
+EOF
+
+    sudo kubeadm init \
+      --v=5 \
+      --upload-certs \
+      --config kubeadm-conf.yaml \
+      | sudo tee /var/log/kubernetes-init.log
+
+    mkdir -p "$HOME/.kube"
+    sudo cp  /etc/kubernetes/admin.conf "$HOME/.kube/config"
+    sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
+
+    logSubstep "Generating worker/control-plane join tokens"
+    local join_cmd
+    join_cmd=$(sudo kubeadm token create --print-join-command)
+    echo "${join_cmd} --cri-socket unix:///var/run/crio/crio.sock" \
+      | sudo tee /var/tmp/k8s-join-worker.txt  >/dev/null
+    echo "${join_cmd} --cri-socket unix:///var/run/crio/crio.sock --control-plane" \
+      | sudo tee /var/tmp/k8s-join-control.txt >/dev/null
+
+    logSubstep "Installing Helm + Cilium CNI"
+    install_helm
+
+  else
+    # ---- Worker / additional control-plane nodes ----
+    logSubstep "Fetching join command from k8s-0"
+    # NOTE: replace rsync hardcoded credentials with SSH key or a secrets manager
+    rsync -avh "pi@192.168.8.200:/var/tmp/k8s-join-worker.txt"  /var/tmp/k8s-join-worker.txt
+    rsync -avh "pi@192.168.8.200:/var/tmp/k8s-join-control.txt" /var/tmp/k8s-join-control.txt
+
+    case "$node_name" in
+      k8s-1|k8s-2)
+        logSubstep "${node_name} joining as additional control-plane"
+        sudo bash -c "$(cat /var/tmp/k8s-join-control.txt)"
+        ;;
+      *)
+        logSubstep "${node_name} joining as worker"
+        sudo bash -c "$(cat /var/tmp/k8s-join-worker.txt)"
+        ;;
+    esac
+  fi
+
+  logSuccess "Bootstrap complete for $(hostname)"
+}
+
+# -----------------------------------------------------------------------------
+# Systemd service helpers
+# -----------------------------------------------------------------------------
+start_product() {
+  local product_name="$1"
+  logStep "[$RANDOMNESS] Starting ${product_name}"
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now "${product_name}.service"
+}
+
+# -----------------------------------------------------------------------------
+# Backup
+# -----------------------------------------------------------------------------
+backup() {
+  logStep "[$RANDOMNESS] ${FUNCNAME[0]}"
+  local item="kubeadm-config"
+  logSubstep "Do you want to ${FUNCNAME[0]} ${item}?"
+  if confirmY; then
+    kubeadm config print init-defaults \
+      --component-configs=InitConfiguration,ClusterConfiguration \
+      > "/var/tmp/${item}.yaml"
+    logSuccess "Backed up to /var/tmp/${item}.yaml"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------------
+cleanup() {
+  logStep "[$RANDOMNESS] ${FUNCNAME[0]}"
+
+  local items=("cert-manager" "cilium" "tf" "kube-certs")
+  for item in "${items[@]}"; do
+    logSubstep "Do you want to cleanup: ${item}?"
+    if ! confirmY; then
+      logWarn "Skipped cleanup for ${item}"
+      continue
+    fi
+    case "$item" in
+      cert-manager)
+        helm -n cert-manager uninstall cert-manager --ignore-not-found 2>/dev/null || true
+        kubectl delete ns cert-manager --ignore-not-found 2>/dev/null || true
+        kubectl get crds 2>/dev/null | grep cert-manager \
+          | awk '{print $1}' | xargs -r kubectl delete crd --ignore-not-found
+        ;;
+      cilium)
+        helm -n kube-system uninstall cilium --ignore-not-found 2>/dev/null || true
+        kubectl delete ns cilium-secrets --ignore-not-found 2>/dev/null || true
+        kubectl get crds 2>/dev/null | grep cilium \
+          | awk '{print $1}' | xargs -r kubectl delete crd --ignore-not-found
+        ;;
+      tf)
+        rm -rf ./iac/.terraform ./iac/.terraform.lock.hcl
+        ;;
+      kube-certs)
+        kubectl get certificates -o name 2>/dev/null \
+          | xargs -r kubectl delete --ignore-not-found
+        kubectl get secrets -o name 2>/dev/null \
+          | xargs -r kubectl delete --ignore-not-found
+        ;;
+    esac
+    logSuccess "Cleaned up: ${item}"
+  done
+}
+trap 'cleanup' SIGINT SIGTERM
+
+# -----------------------------------------------------------------------------
+# IaC (OpenTofu / Terraform)
+# -----------------------------------------------------------------------------
+init_iac() {
+  logStep "[$RANDOMNESS] ${FUNCNAME[0]}"
+  pushd iac >/dev/null
+
+  local iac_cmd=""
+  # Prefer tofu; fall back to terraform
+  if commandExists tofu; then
+    iac_cmd=tofu
+    logSubstep "Using OpenTofu $(tofu version | head -1)"
+  elif commandExists terraform; then
+    iac_cmd=terraform
+    logSubstep "Using Terraform $(terraform version | head -1)"
+  else
+    logSubstep "Neither tofu nor terraform found — installing OpenTofu"
+    local installer
+    installer=$(mktemp)
+    curl --proto '=https' --tlsv1.2 -fsSL https://get.opentofu.org/install-opentofu.sh \
+      -o "$installer"
+    chmod +x "$installer"
+    "$installer" || { logFail "OpenTofu installation failed."; rm -f "$installer"; exit 1; }
+    rm -f "$installer"
+    iac_cmd=tofu
+  fi
+
+  "$iac_cmd" init
+  "$iac_cmd" apply --auto-approve
+
+  popd >/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# GitOps
+# -----------------------------------------------------------------------------
+init_gitops() {
+  logStep "[$RANDOMNESS] ${FUNCNAME[0]}"
+  pushd gitops >/dev/null
+
+  cp -- *.* /var/tmp/ 2>/dev/null || true
+
+  promptForGithubToken
+  promptForGithubOrg
+  promptForGithubUser
+  promptForGithubRepo
+
+  local repo_dir="/var/tmp/${GITHUB_REPO}"
+  git clone "https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/${GITHUB_REPO}.git" "$repo_dir"
+
+  logSubstep "Copying cluster manifests to ${repo_dir}"
+  cp -r base "$repo_dir/"
+
+  pushd "$repo_dir" >/dev/null
+  git status
+  git add .
+  git commit -m "chore: sync k8s-vanilla manifests [${RANDOMNESS}]"
+  # git push  # uncomment when ready
+  popd >/dev/null
+
+  logSubstep "Checking BGP peers via Cilium"
+  cilium bgp peers && cilium bgp routes
+
+  popd >/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# cert-manager
+# -----------------------------------------------------------------------------
+config_certmanager() {
+  local item="cert-manager"
+  logStep "[$RANDOMNESS] Do you want to setup ${item}?"
+  confirmY || { logWarn "Skipping ${item}"; return; }
+
+  helm repo add jetstack https://charts.jetstack.io
+  helm repo update
+
+  logSubstep "Installing Gateway API CRDs ${GATEWAY_API_VERSION}"
+  kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+
+  logSubstep "Installing cert-manager via Helm"
+  helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+    --namespace cert-manager \
+    --create-namespace \
+    --values ./helm/values-certmanager.yaml \
+    --wait
+
+  logSubstep "Applying additional Gateway API CRDs"
+  local base="https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/${GATEWAY_API_VERSION}/config/crd"
+  for crd in \
+    standard/gateway.networking.k8s.io_gatewayclasses.yaml \
+    standard/gateway.networking.k8s.io_gateways.yaml \
+    standard/gateway.networking.k8s.io_httproutes.yaml \
+    standard/gateway.networking.k8s.io_referencegrants.yaml \
+    standard/gateway.networking.k8s.io_grpcroutes.yaml \
+    experimental/gateway.networking.k8s.io_tlsroutes.yaml \
+    experimental/gateway.networking.k8s.io_gateways.yaml; do
+    kubectl apply -f "${base}/${crd}"
+  done
+
+  logSubstep "Restarting cert-manager deployment"
+  kubectl rollout restart deployment cert-manager -n cert-manager
+
+  logSubstep "Applying Cilium CA Issuer & HTTPS Gateway examples"
+  kubectl apply -f "https://raw.githubusercontent.com/cilium/cilium/${CILIUM_VERSION}/examples/kubernetes/servicemesh/ca-issuer.yaml"
+  kubectl apply -f "https://raw.githubusercontent.com/cilium/cilium/${CILIUM_VERSION}/examples/kubernetes/gateway/basic-https.yaml"
+  kubectl annotate gateway tls-gateway cert-manager.io/issuer=ca-issuer
+
+  kubectl get certificate,secret -A
+  kubectl get gateway tls-gateway
+  kubectl get httproutes https-app-route-1 https-app-route-2
+
+  logSuccess "Setup complete: ${item}"
+}
+
+# -----------------------------------------------------------------------------
+# Cilium CNI
+# -----------------------------------------------------------------------------
+config_cilium() {
+  logStep "[$RANDOMNESS] Do you want to configure Cilium?"
+  confirmY || { logWarn "Skipping Cilium config"; return; }
+
+  helm repo add cilium https://helm.cilium.io/
+  helm repo update
+  helm upgrade --install cilium cilium/cilium \
+    --namespace kube-system \
+    --version "${CILIUM_VERSION}" \
+    --values ./helm/values-cilium.yaml \
+    --wait
+
+  logSuccess "Cilium configured."
+}
+
+# -----------------------------------------------------------------------------
+# BGP router config
+# -----------------------------------------------------------------------------
+config_router() {
+  local item="./bgp.conf"
+  printf "Do you want to create %s? " "$item"
+  if ! confirmY; then
+    logWarn "Skipping ${item}"
+    return
+  fi
+
+  if [[ -s "$item" ]]; then
+    logSubstep "${item} already exists and is non-empty — install it on Unifi under Settings > BGP."
+  else
+    tee "$item" >/dev/null <<'EOF'
+router bgp 65000
+  bgp bestpath as-path multipath-relax
+  bgp router-id 192.168.2.1
+  no bgp ebgp-requires-policy
+  neighbor k8s peer-group
+  neighbor k8s remote-as external
+  neighbor 192.168.8.10 peer-group k8s
+  neighbor 192.168.8.11 peer-group k8s
+  neighbor 192.168.8.12 peer-group k8s
+  neighbor 192.168.8.13 peer-group k8s
+  neighbor 192.168.8.14 peer-group k8s
+  neighbor 192.168.1.50 peer-group k8s
+EOF
+    logSuccess "Created ${item}"
+  fi
+
+  kubectl apply -f ./gitops/bgp-control-plane.yaml
+}
+
+# -----------------------------------------------------------------------------
+# Secrets generation
+# -----------------------------------------------------------------------------
+config_secrets() {
+  local item="Secrets for GitOps & IaC"
+  logStep "[$RANDOMNESS] Do you want to create: ${item}?"
+  confirmY || { logWarn "Skipping ${item}"; return; }
+
+  local DIR_GITOPS="/var/tmp/${RANDOMNESS}/gitops"
+  local DIR_IAC="/var/tmp/${RANDOMNESS}/iac"
+  mkdir -p "$DIR_GITOPS" "$DIR_IAC"
+
+  promptIfUnset CLOUDFLARE_USER  "Enter Cloudflare user email:"
+  promptIfUnset CLOUDFLARE_TOKEN "Enter Cloudflare API token:"
+  promptIfUnset CLOUDFLARE_ZONE  "Enter Cloudflare zone (e.g. example.com):"
+
+  logSubstep "Writing ${DIR_GITOPS}/issuer-cloudflare.yaml"
+  tee "${DIR_GITOPS}/issuer-cloudflare.yaml" >/dev/null <<EOF
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudflare-api-token-secret
+type: Opaque
+stringData:
+  api-token: "${CLOUDFLARE_TOKEN}"
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    email: "admin@${CLOUDFLARE_ZONE}"
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    server: https://acme-v02.api.letsencrypt.org/directory
+    solvers:
+    - dns01:
+        cloudflare:
+          email: "${CLOUDFLARE_USER}"
+          apiTokenSecretRef:
+            name: cloudflare-api-token-secret
+            key: api-token
+EOF
+
+  logSubstep "Writing ${DIR_IAC}/issuer-cloudflare.tf"
+  tee "${DIR_IAC}/issuer-cloudflare.tf" >/dev/null <<EOF
+resource "kubernetes_manifest" "cloudflare_secret" {
+  manifest = {
+    apiVersion = "v1"
+    kind       = "Secret"
+    metadata = {
+      name = "cloudflare-api-token-secret"
+    }
+    type = "Opaque"
+    stringData = {
+      api-token = "${CLOUDFLARE_TOKEN}"
+    }
+  }
+}
+
+resource "kubernetes_manifest" "cloudflare_issuer" {
+  manifest = {
+    apiVersion = "cert-manager.io/v1"
+    kind       = "Issuer"
+    metadata = {
+      name = "letsencrypt"
+    }
+    spec = {
+      acme = {
+        email = "admin@${CLOUDFLARE_ZONE}"
+        privateKeySecretRef = {
+          name = "letsencrypt-prod-account-key"
+        }
+        server = "https://acme-v02.api.letsencrypt.org/directory"
+        solvers = [{
+          dns01 = {
+            cloudflare = {
+              email = "${CLOUDFLARE_USER}"
+              apiTokenSecretRef = {
+                name = "cloudflare-api-token-secret"
+                key  = "api-token"
+              }
+            }
+          }
+        }]
+      }
+    }
+  }
+}
+EOF
+
+  logSubstep "Writing ${DIR_GITOPS}/certificate.yaml"
+  tee "${DIR_GITOPS}/certificate.yaml" >/dev/null <<EOF
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: "${CLOUDFLARE_ZONE}-tls"
+  namespace: default
+spec:
+  secretName: "${CLOUDFLARE_ZONE}-tls"
+  issuerRef:
+    name: letsencrypt
+    kind: Issuer
+  commonName: "${CLOUDFLARE_ZONE}"
+  dnsNames:
+    - "${CLOUDFLARE_ZONE}"
+EOF
+
+  logSuccess "Secret manifests generated (YAML + TF) in /var/tmp/${RANDOMNESS}/"
+}
+
+# -----------------------------------------------------------------------------
+# CLI tools
+# -----------------------------------------------------------------------------
+got_cli() {
+  logStep "[$RANDOMNESS] Ensuring Cilium CLI is installed"
+  if commandExists cilium; then
+    logSubstep "Cilium CLI already present: $(cilium version --client 2>/dev/null | head -1)"
+    return
+  fi
+
+  local CILIUM_CLI_VERSION CLI_ARCH
+  CILIUM_CLI_VERSION=$(curl -fsSL https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+  CLI_ARCH="amd64"
+
+  local os tarball checksum_file
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    [[ "$(uname -m)" == "arm64" ]] && CLI_ARCH="arm64"
+    os="darwin"
+  else
+    [[ "$(uname -m)" == "aarch64" ]] && CLI_ARCH="arm64"
+    os="linux"
+  fi
+
+  tarball="cilium-${os}-${CLI_ARCH}.tar.gz"
+  checksum_file="${tarball}.sha256sum"
+
+  curl -L --fail --remote-name-all \
+    "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/${tarball}" \
+    "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/${checksum_file}"
+
+  if [[ "$os" == "darwin" ]]; then
+    shasum -a 256 -c "$checksum_file"
+  else
+    sha256sum --check "$checksum_file"
+  fi
+
+  sudo tar -xzvf "$tarball" -C /usr/local/bin
+  rm -f "$tarball" "$checksum_file"
+
+  logSuccess "Cilium CLI installed: $(cilium version --client 2>/dev/null | head -1)"
+}
+
+got_flux() {
+  logStep "[$RANDOMNESS] Ensuring Flux is installed"
+
+  _install_flux_cli() {
+    curl --proto '=https' --tlsv1.2 -sSf https://fluxcd.io/install.sh | sudo bash
+  }
+
+  commandExists flux || _install_flux_cli
+
+  logSubstep "Flux CLI: $(flux version --client | head -1)"
+
+  if kubectl get crd kustomizations.kustomize.toolkit.fluxcd.io &>/dev/null; then
+    logSubstep "Flux CRDs already installed."
+    return
+  fi
+
+  promptForGithubToken
+  promptForGithubOrg
+  promptForGithubRepo
+
+  logSubstep "Checking cluster prerequisites"
+  flux check --pre
+
+  logSubstep "Bootstrapping Flux → ${GITHUB_ORG}/${GITHUB_REPO}"
+  flux bootstrap github \
+    --token-auth \
+    --owner="${GITHUB_ORG}" \
+    --repository="${GITHUB_REPO}" \
+    --branch=main \
+    --path="clusters/my-cluster" \
+    --personal \
+    --token="${GITHUB_TOKEN}"
+
+  flux check
+  logSuccess "Flux bootstrap complete."
+}
+
+# -----------------------------------------------------------------------------
+# Rolling update (drain → ssh upgrade → reboot → uncordon)
+# -----------------------------------------------------------------------------
+update() {
+  logStep "[$RANDOMNESS] ${FUNCNAME[0]}"
+  local SERVER_LIST=(k8s-0 k8s-1 k8s-2 k8s-3 k8s-4 nuc)
+  local REMOTE_COMMAND="sudo apt-get update && sudo apt-get upgrade -y && sudo reboot"
+  local REMOTE_USER="pi"
+
+  for REMOTE_HOST in "${SERVER_LIST[@]}"; do
+    logSubstep "Draining ${REMOTE_HOST}"
+    if [[ "$REMOTE_HOST" == "k8s-0" ]]; then
+      kubectl drain "$REMOTE_HOST" --ignore-daemonsets --delete-emptydir-data \
+        -v=6 --server=https://k8s-1:6443
+    else
+      kubectl drain "$REMOTE_HOST" --ignore-daemonsets --delete-emptydir-data -v=6
+    fi
+
+    logSubstep "Running upgrade on ${REMOTE_HOST}"
+    ssh "${REMOTE_USER}@${REMOTE_HOST}" "$REMOTE_COMMAND"
+
+    logSubstep "Waiting for ${REMOTE_HOST} to go offline"
+    while timeout 2s bash -c "cat </dev/null >/dev/tcp/${REMOTE_HOST}/22" 2>/dev/null; do
+      sleep 5
+    done
+
+    logSubstep "Waiting for ${REMOTE_HOST} to come back online"
+    until timeout 2s bash -c "cat </dev/null >/dev/tcp/${REMOTE_HOST}/22" 2>/dev/null; do
+      sleep 5
+    done
+    sleep 10  # let SSH daemon fully start
+
+    logSubstep "Post-boot cleanup on ${REMOTE_HOST}"
+    ssh "${REMOTE_USER}@${REMOTE_HOST}" '
+      if [[ -f /var/run/reboot-required ]]; then
+        echo "Rebooted successfully."
+      fi
+      sudo apt-get autoremove -y
+      sudo swapoff -a
+      echo "Pausing for etcd to stabilise…"
+      sleep 15
+    '
+
+    logSubstep "Uncordoning ${REMOTE_HOST}"
+    if [[ "$REMOTE_HOST" == "k8s-0" ]]; then
+      kubectl uncordon "$REMOTE_HOST" -v=6 --server=https://k8s-1:6443
+    else
+      kubectl uncordon "$REMOTE_HOST" -v=6
+    fi
+
+    logSuccess "Update complete for ${REMOTE_HOST}"
+  done
+}
+
+# -----------------------------------------------------------------------------
+# Kubernetes version upgrade (kubeadm upgrade)
+# -----------------------------------------------------------------------------
+upgrade() {
+  logStep "[$RANDOMNESS] ${FUNCNAME[0]}"
+  local SERVER_LIST=(k8s-0 k8s-1 k8s-2 k8s-3 k8s-4 nuc)
+  local REMOTE_COMMAND="sudo kubeadm upgrade plan && sudo kubeadm upgrade apply ${K8S_VERSION_LONG} -y"
+  local REMOTE_USER="pi"
+
+  logSubstep "Upgrading cluster to ${K8S_VERSION_LONG}"
+
+  # Build per-node kubeconfig overrides (to handle k8s-0 being drained)
+  local config_k8s1 config_k8s2
+  config_k8s1=$(mktemp)
+  config_k8s2=$(mktemp)
+  cp ~/.kube/config "$config_k8s1" && sed -i 's/k8s-0/k8s-1/g' "$config_k8s1"
+  cp ~/.kube/config "$config_k8s2" && sed -i 's/k8s-0/k8s-2/g' "$config_k8s2"
+
+  for REMOTE_HOST in "${SERVER_LIST[@]}"; do
+    local KUBE_CONFIG=~/.kube/config
+    [[ "$REMOTE_HOST" == "k8s-1" ]] && KUBE_CONFIG="$config_k8s1"
+    [[ "$REMOTE_HOST" == "k8s-2" ]] && KUBE_CONFIG="$config_k8s2"
+
+    logSubstep "Draining ${REMOTE_HOST}"
+    kubectl drain "$REMOTE_HOST" --ignore-daemonsets --delete-emptydir-data \
+      -v=6 --kubeconfig="$KUBE_CONFIG"
+
+    logSubstep "Upgrading ${REMOTE_HOST}"
+    ssh "${REMOTE_USER}@${REMOTE_HOST}" "$REMOTE_COMMAND"
+
+    logSubstep "Uncordoning ${REMOTE_HOST}"
+    kubectl uncordon "$REMOTE_HOST" -v=6 --kubeconfig="$KUBE_CONFIG"
+
+    logSuccess "Upgrade complete for ${REMOTE_HOST}"
+  done
+
+  rm -f "$config_k8s1" "$config_k8s2"
+}
+
+# -----------------------------------------------------------------------------
+# Interactive setup wizard
+# -----------------------------------------------------------------------------
+setup() {
+  logStep "[$RANDOMNESS] Interactive setup wizard"
+
+  local items=("cilium" "cert-manager" "gitops via flux" "IaC via tofu/terraform" "BGP router config")
+  local funcs=(config_cilium config_certmanager got_flux init_iac config_router)
+
+  for i in "${!items[@]}"; do
+    logSubstep "Do you want to setup: ${items[$i]}?"
+    if confirmY; then
+      case "${items[$i]}" in
+        cilium) got_cli; config_cilium ;;
+        *)      "${funcs[$i]}" ;;
+      esac
+      logSuccess "Setup complete: ${items[$i]}"
+    else
+      logWarn "Skipping: ${items[$i]}"
+    fi
+  done
+
+  logSuccess "Setup wizard finished."
+}
+
+# -----------------------------------------------------------------------------
+# Help
+# -----------------------------------------------------------------------------
+print_help() {
+  cat <<'EOF'
+Usage: ./run <command> [command ...]
+
+Commands:
+  bootstrap   Full node bootstrap (preflight → CRI-O → kubeadm init/join)
+  setup       Interactive wizard (Cilium, cert-manager, Flux, IaC, BGP)
+  update      Rolling OS update across all nodes (drain → upgrade → reboot → uncordon)
+  upgrade     Rolling Kubernetes version upgrade across all nodes
+  cleanup     Interactively remove cert-manager, Cilium, TF state, or k8s secrets
+  gitops      Configure BGP + secrets, then sync GitOps repo
+  iac         Configure BGP + secrets, then run OpenTofu/Terraform apply
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Entry point — supports multiple sub-commands in one invocation
+# -----------------------------------------------------------------------------
+if [[ $# -eq 0 ]]; then
+  print_help
+  exit 0
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    bootstrap) bootstrap    ;;
+    cleanup)   cleanup      ;;
+    gitops)    config_router; config_secrets; init_gitops ;;
+    iac)       config_router; config_secrets; init_iac    ;;
+    setup)     setup        ;;
+    update)    update       ;;
+    upgrade)   upgrade      ;;
+    help|--help|-h) print_help ;;
+    *)
+      logWarn "Unknown command: ${arg}"
+      print_help
+      exit 1
+      ;;
+  esac
+done

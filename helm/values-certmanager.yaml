@@ -1,0 +1,18 @@
+config:
+  apiVersion: controller.config.cert-manager.io/v1alpha1
+  enableGatewayAPI: true
+  kind: ControllerConfiguration
+  kubernetesAPIBurst: 9000
+  kubernetesAPIQPS: 9000
+  leaderElectionConfig:
+    namespace: kube-system
+  logging:
+    format: text
+    verbosity: 2
+  numberOfConcurrentWorkers: 200
+crds:
+  enabled: true
+extraArgs:
+- --acme-http01-solver-nameservers=8.8.8.8:53,1.1.1.1:53
+prometheus:
+  enabled: false
